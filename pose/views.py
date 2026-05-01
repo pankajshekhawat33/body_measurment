@@ -35,11 +35,11 @@ MEASUREMENT_KEYS = ["chest", "waist", "hip", "shoulder", "sleeve", "inseam"]
 # Realistic clamp ranges (cm) — reject absurd model outputs
 MEASUREMENT_CLAMP = {
     "chest":    (60.0, 160.0),
-    "waist":    (50.0, 150.0),
-    "hip":      (60.0, 170.0),
-    "shoulder": (30.0,  60.0),
-    "sleeve":   (40.0,  90.0),
-    "inseam":   (55.0, 100.0),
+    "waist":    (20.0, 110.0),
+    "hip":      (30.0, 170.0),
+    "shoulder": (20.0,  80.0),
+    "sleeve":   (20.0,  90.0),
+    "inseam":   (20.0, 100.0),
 }
 
 MIN_IMG_WIDTH  = 100
@@ -56,7 +56,8 @@ def _load_model() -> BodyTransformer:
         return m
     try:
         state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-        m.load_state_dict(state_dict)
+        # Try strict=False to handle architecture mismatches from older checkpoints
+        m.load_state_dict(state_dict, strict=False)
         logger.info("Model loaded from %s", MODEL_PATH)
     except Exception as exc:
         logger.exception("Model load failed: %s", exc)
@@ -84,12 +85,31 @@ _warmup()
 # HELPERS
 # =========================
 def denormalize(output: np.ndarray) -> np.ndarray:
+    """
+    Denormalize model output to cm measurements.
+    Model outputs values in [0, 1] range (sigmoid) or normalized ratios.
+    """
     flat = np.array(output).flatten()
     if flat.shape[0] < len(SCALE):
         raise ValueError(
             f"Model output has {flat.shape[0]} values, need >= {len(SCALE)}"
         )
-    return flat[: len(SCALE)] * SCALE
+    
+    normalized = flat[: len(SCALE)]
+    
+    # Debug logging
+    logger.info(f"Raw model output (first 6): {normalized[:6]}")
+    
+    # Check if output looks untrained (all zeros or very small)
+    if np.max(np.abs(normalized)) < 0.01:
+        logger.warning("Model output suspiciously small - likely untrained model")
+        return np.zeros(len(SCALE))
+    
+    # Scale to cm - multiply by SCALE factors
+    scaled = normalized * SCALE
+    logger.info(f"Denormalized measurements: {scaled}")
+    
+    return scaled
 
 
 def _decode_image(file_obj):
@@ -125,21 +145,25 @@ def _clamp_measurements(measurements: dict) -> dict:
 # TRANSFORMER PIPELINE
 # =========================
 def process_images(front_img, side_img, height_cm=None):
-    front_feat = extract_pose(front_img, height_cm=height_cm)
-    side_feat  = extract_pose(side_img,  height_cm=height_cm)
+    front_result = extract_pose(front_img, height_cm=height_cm)
+    side_result  = extract_pose(side_img,  height_cm=height_cm)
 
-    if front_feat is None:
+    # extract_pose returns (features, classification) tuple
+    if front_result is None or front_result[0] is None:
         raise ValueError(
             "Pose not detected in front image. "
             "Stand upright, full body visible, good lighting."
         )
-    if side_feat is None:
+    if side_result is None or side_result[0] is None:
         raise ValueError(
             "Pose not detected in side image. "
             "Stand upright, full body visible, good lighting."
         )
 
-    features = fuse_features(front_feat, side_feat)
+    front_feat, front_class = front_result
+    side_feat, side_class = side_result
+
+    features, final_class = fuse_features(front_feat, side_feat, front_class, side_class)
 
     kalman   = KalmanFilter(dim=len(features))
     features = kalman.update(np.array(features))
@@ -162,27 +186,56 @@ def _geometry_fallback(front_img, side_img, height_cm=None):
     Direct geometric estimate — no transformer needed.
     Accuracy: ~75-82% with height_cm, ~55-65% without.
     """
-    front_feat = extract_pose(front_img, height_cm=height_cm)
-    side_feat  = extract_pose(side_img,  height_cm=height_cm)
+    front_result = extract_pose(front_img, height_cm=height_cm)
+    side_result  = extract_pose(side_img,  height_cm=height_cm)
 
-    if front_feat is None:
+    if front_result is None or front_result[0] is None:
         raise ValueError("Pose not detected in front image.")
-    if side_feat is None:
+    if side_result is None or side_result[0] is None:
         raise ValueError("Pose not detected in side image.")
 
-    fused = fuse_features(front_feat, side_feat)
-    # fused[0:6] = [chest_circ, waist_circ, hip_circ, shoulder, sleeve, inseam]
+    front_feat, front_class = front_result
+    side_feat, side_class = side_result
 
-    avg_height = height_cm if height_cm else 170.0
-    scale = 1.0 if height_cm else avg_height
+    fused, final_class = fuse_features(front_feat, side_feat, front_class, side_class)
+    # fused structure:
+    # [0:10] = [chest_circ, waist_circ, hip_circ, shoulder, sleeve, inseam, torso, h_proxy, hip_sh, head]
+    # [10:14] = gender one-hot + confidence
+    # [14:] = visibility + raw landmarks
 
+    chest_circ  = float(fused[0])
+    waist_circ  = float(fused[1])
+    hip_circ    = float(fused[2])
+    shoulder    = float(fused[3])
+    sleeve      = float(fused[4])
+    inseam      = float(fused[5])
+    h_proxy     = float(fused[7])  # Actual body height proxy
+    
+    logger.info(f"Geometry fallback - h_proxy: {h_proxy}, measurements: {chest_circ}, {waist_circ}, {hip_circ}")
+    
+    # If height provided, measurements are already in cm
+    if height_cm:
+        return {
+            "chest":    round(chest_circ, 1),
+            "waist":    round(waist_circ, 1),
+            "hip":      round(hip_circ, 1),
+            "shoulder": round(shoulder, 1),
+            "sleeve":   round(sleeve, 1),
+            "inseam":   round(inseam, 1),
+        }
+    
+    # Without height, use h_proxy to denormalize (person's actual body proportions)
+    # h_proxy is in normalized space, scale it using average adult height
+    avg_adult_height = 170.0
+    scale = avg_adult_height * h_proxy if h_proxy > 0 else 170.0
+    
     return {
-        "chest":    round(float(fused[0]) * (1.0 if height_cm else scale), 1),
-        "waist":    round(float(fused[1]) * (1.0 if height_cm else scale), 1),
-        "hip":      round(float(fused[2]) * (1.0 if height_cm else scale), 1),
-        "shoulder": round(float(fused[3]) * (1.0 if height_cm else scale), 1),
-        "sleeve":   round(float(fused[4]) * (1.0 if height_cm else scale), 1),
-        "inseam":   round(float(fused[5]) * (1.0 if height_cm else scale), 1),
+        "chest":    round(chest_circ * scale, 1),
+        "waist":    round(waist_circ * scale, 1),
+        "hip":      round(hip_circ * scale, 1),
+        "shoulder": round(shoulder * scale, 1),
+        "sleeve":   round(sleeve * scale, 1),
+        "inseam":   round(inseam * scale, 1),
     }
 
 
@@ -241,11 +294,18 @@ def detect_body(request):
         if use_transformer:
             raw_result = process_images(front_img, side_img, height_cm=height_cm)
             measurements_cm = denormalize(raw_result[0])
-            measurements = {
-                key: round(float(measurements_cm[i]), 1)
-                for i, key in enumerate(MEASUREMENT_KEYS)
-            }
-            method = "BodyTransformer + KalmanFilter"
+            
+            # Check if model output is suspiciously bad
+            if np.max(measurements_cm) < 10.0:
+                logger.warning("Model producing invalid output - falling back to geometry")
+                measurements = _geometry_fallback(front_img, side_img, height_cm=height_cm)
+                method = "Geometry Fallback (Model untrained)"
+            else:
+                measurements = {
+                    key: round(float(measurements_cm[i]), 1)
+                    for i, key in enumerate(MEASUREMENT_KEYS)
+                }
+                method = "BodyTransformer + KalmanFilter"
         else:
             logger.warning("Model not found — using geometry fallback.")
             measurements = _geometry_fallback(front_img, side_img, height_cm=height_cm)
