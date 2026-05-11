@@ -135,3 +135,6 @@ CORS_ALLOW_HEADERS = [
 ]
 
 CORS_ALLOW_CREDENTIALS = True
+
+
+BODY_AI_DATASET_PATH = os.path.join(BASE_DIR, "pose", "dataset.csv")

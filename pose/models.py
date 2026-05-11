@@ -1,25 +1,29 @@
 """
 models.py — BodyTransformer with gender/age-aware architecture.
 
-Input feature vector size breakdown (per fused_features):
-  10  geometric features   (fused_geo)
+FIX: INPUT_SIZE corrected to match ai_utils.py feature vector.
+
+Feature vector breakdown (per fused_features from fuse_features()):
+  16  geometric features   (N_GEO=16, fused_geo)
    4  gender one-hot       (gender_fused)
    4  front visibility
  132  front raw landmarks  (33 × 4)
    4  side visibility
  132  side raw landmarks   (33 × 4)
   ──────────────────────────────────
- 286  TOTAL INPUT FEATURES
+ 292  TOTAL
 
-Output: 6 measurements [chest, waist, hip, shoulder, sleeve, inseam]
+Note: models.py original had INPUT_SIZE=286 (based on N_GEO=10).
+      Now N_GEO=16 → INPUT_SIZE = 16+4+4+132+4+132 = 292.
+      The pad/trim in forward() still works as safety net.
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
-INPUT_SIZE  = 286
+# Derived from ai_utils.py: N_GEO=16, gender=4, vis=4, lm=132, ×2 views
+INPUT_SIZE  = 292   # FIX: was 286 (N_GEO=10), now 292 (N_GEO=16)
 OUTPUT_SIZE = 6
 D_MODEL     = 256
 
@@ -28,48 +32,43 @@ class BodyTransformer(nn.Module):
     """
     Transformer-based body measurement predictor.
 
-    Architecture improvements over v1:
-    - Correct input size (286) matching updated ai_utils feature vector.
-    - Gender-aware gating: a learned gate scales transformer output based
-      on the gender one-hot embedding, letting the model learn different
-      measurement patterns for male / female / kid.
-    - Deeper head (3 → 4 linear layers) with dropout for regularization.
-    - LayerNorm on input projection output.
+    Input:  (batch, 1, INPUT_SIZE) or (batch, INPUT_SIZE)
+    Output: (batch, 6)  → [chest, waist, hip, shoulder, sleeve, inseam] normalized 0-1
+
+    Gender-aware gating: learns different measurement patterns per gender.
+    Gender one-hot is at fused_features[16:20] (after N_GEO=16 geometric).
     """
 
     def __init__(
         self,
-        input_size:  int = INPUT_SIZE,
-        d_model:     int = D_MODEL,
-        output_size: int = OUTPUT_SIZE,
-        nhead:       int = 8,
-        num_layers:  int = 4,
+        input_size:  int   = INPUT_SIZE,
+        d_model:     int   = D_MODEL,
+        output_size: int   = OUTPUT_SIZE,
+        nhead:       int   = 8,
+        num_layers:  int   = 4,
         dropout:     float = 0.1,
     ):
         super().__init__()
-
         self.input_size = input_size
 
-        # Input projection
         self.input_proj = nn.Sequential(
             nn.Linear(input_size, d_model),
             nn.LayerNorm(d_model),
         )
 
-        # Gender gate — projects gender one-hot (4-dim) to d_model scale factors
+        # Gender gate uses indices 16:20 (N_GEO=16 → gender starts at 16)
         self.gender_gate = nn.Sequential(
             nn.Linear(4, d_model),
             nn.Sigmoid(),
         )
 
-        # Transformer encoder
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=d_model * 4,
             dropout=dropout,
             batch_first=True,
-            norm_first=True,   # Pre-LN for better training stability
+            norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
@@ -77,7 +76,6 @@ class BodyTransformer(nn.Module):
             enable_nested_tensor=False,
         )
 
-        # Prediction head
         self.head = nn.Sequential(
             nn.Linear(d_model, 256),
             nn.GELU(),
@@ -91,47 +89,33 @@ class BodyTransformer(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Tensor of shape (batch, 1, input_size) or (batch, input_size)
-        Returns:
-            Tensor of shape (batch, output_size)
-        """
-        # Handle (batch, 1, N) → (batch, N)
         if x.dim() == 3:
             x = x.squeeze(1)
 
-        # Dynamic size fix: pad or trim to expected input_size
+        # Pad or trim to expected input_size (safety net for version mismatches)
         if x.shape[1] > self.input_size:
             x = x[:, :self.input_size]
         elif x.shape[1] < self.input_size:
-            pad_size = self.input_size - x.shape[1]
-            x = F.pad(x, (0, pad_size))
+            x = F.pad(x, (0, self.input_size - x.shape[1]))
 
-        # Extract gender one-hot (indices 10:14 in fused feature vector)
-        gender_vec = x[:, 10:14]   # [male, female, kid, confidence]
+        # Gender one-hot at indices 16:20 (N_GEO=16)
+        gender_vec = x[:, 16:20]
 
-        # Input projection with gender gating
-        projected  = self.input_proj(x)          # (batch, d_model)
-        gate       = self.gender_gate(gender_vec) # (batch, d_model)
-        gated      = projected * gate             # element-wise scale
+        projected = self.input_proj(x)
+        gate      = self.gender_gate(gender_vec)
+        gated     = projected * gate
 
-        # Transformer expects (batch, seq_len, d_model)
-        seq = gated.unsqueeze(1)                  # (batch, 1, d_model)
-        out = self.transformer(seq)               # (batch, 1, d_model)
-        out = out[:, -1, :]                       # (batch, d_model)
-
-        return self.head(out)                     # (batch, output_size)
+        seq = gated.unsqueeze(1)
+        out = self.transformer(seq)
+        out = out[:, -1, :]
+        return self.head(out)
 
 
 # ---------------------------------------------------------------------------
-# Training utils (only needed for training, not inference)
+# Training utils
 # ---------------------------------------------------------------------------
 class MeasurementLoss(nn.Module):
-    """
-    Weighted MSE loss. Chest and waist are weighted higher because
-    they are harder to estimate and most critical for tailoring.
-    """
+    """Weighted MSE — chest and waist weighted higher (harder to estimate)."""
 
     def __init__(self):
         super().__init__()
