@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: pose-api
+    runtime: python
+
+    buildCommand: |
+      pip install -r requirements.txt
+      python manage.py collectstatic --noinput
+      python manage.py migrate
+
+    startCommand: gunicorn pose_project.wsgi:application
+
+    envVars:
+      - key: DEBUG
+        value: "False"
+
+      - key: SECRET_KEY
+        generateValue: true
+
+      - key: WEB_CONCURRENCY
+        value: "1"

@@ -8,6 +8,7 @@ from django.conf import settings
 from rest_framework.decorators import api_view
 from rest_framework.response import Response
 from rest_framework import status
+from .yolo_detect import detect_person
 
 from .models import BodyTransformer
 from .ai_utils import extract_pose, fuse_features, KalmanFilter
@@ -31,6 +32,9 @@ CSV_PATH = getattr(
 )
 
 MEASUREMENT_KEYS = ["chest", "waist", "hip", "shoulder", "sleeve", "inseam"]
+
+global EXPECTED_FEATURES
+EXPECTED_FEATURES = 300 
 
 # Realistic mean adult measurements (cm) — used when no CSV found
 # Updated with better calibration for average adult male
@@ -105,88 +109,101 @@ MIN_IMG_HEIGHT = 200
 # =========================
 def _save_to_dataset_csv(features_array: np.ndarray, measurements: dict, dataset_path: str = "pose/dataset.csv"):
     """
-    Save extracted features + measurements to dataset.csv for model training.
-    Format: [f0, f1, ..., f264, chest, waist, hip, shoulder, sleeve, inseam]
+    Save extracted features + measurements safely to dataset.csv
     """
+
     try:
         features_flat = np.array(features_array).flatten()
-        n_features = len(features_flat)
-        feature_cols = [f"f{i}" for i in range(n_features)]
-        measurement_cols = ["chest", "waist", "hip", "shoulder", "sleeve", "inseam"]
-        all_cols = feature_cols + measurement_cols
-        
-        row_data = list(features_flat) + [
-            measurements["chest"],
-            measurements["waist"],
-            measurements["hip"],
-            measurements["shoulder"],
-            measurements["sleeve"],
-            measurements["inseam"],
+
+        logger.info(f"Feature length: {len(features_flat)}")
+
+        # Prevent corrupted CSV rows
+        if len(features_flat) != EXPECTED_FEATURES:
+            logger.warning(
+                f"Skipping dataset save: expected {EXPECTED_FEATURES} features, got {len(features_flat)}"
+            )
+            return False
+
+        feature_cols = [f"f{i}" for i in range(EXPECTED_FEATURES)]
+
+        measurement_cols = [
+            "chest",
+            "waist",
+            "hip",
+            "shoulder",
+            "sleeve",
+            "inseam",
         ]
-        
+
+        all_cols = feature_cols + measurement_cols
+
+        row_data = list(features_flat) + [
+            float(measurements["chest"]),
+            float(measurements["waist"]),
+            float(measurements["hip"]),
+            float(measurements["shoulder"]),
+            float(measurements["sleeve"]),
+            float(measurements["inseam"]),
+        ]
+
         file_exists = os.path.exists(dataset_path)
+
         os.makedirs(os.path.dirname(dataset_path), exist_ok=True)
-        
+
         writer = pd.DataFrame([row_data], columns=all_cols)
-        with open(dataset_path, "a", newline="") as f:
-            writer.to_csv(f, index=False, header=(not file_exists))
-        
-        logger.info(f"Dataset row saved: {dataset_path}")
+
+        writer.to_csv(
+            dataset_path,
+            mode="a",
+            index=False,
+            header=not file_exists,
+        )
+
+        logger.info(f"Dataset row saved successfully: {dataset_path}")
+
         return True
+
     except Exception as exc:
-        logger.warning(f"Failed to save to dataset.csv: {exc}")
+        logger.exception(f"Failed to save to dataset.csv: {exc}")
+        EXPECTED_FEATURES = 300
         return False
 
 
 
 def _build_dynamic_scale(front_img, fused_ratios, height_cm=None):
-    """
-    Per-image adaptive scale.
-    fused_ratios: [chest, waist, hip, shoulder, sleeve, inseam] (0–1)
-    """
 
     ratios = np.array(fused_ratios[:6], dtype=np.float32)
 
-    # 1) base prior (dataset or default)
-    base = SCALE.copy()
-
-    # 2) height-based prior (strong signal)
     if height_cm:
-        h_prior = _get_height_ratios(height_cm) * height_cm
+        base = _get_height_ratios(height_cm) * height_cm
     else:
-        h_prior = base
+        base = SCALE.copy()
 
-    # 3) body-type multiplier
     body_type = _detect_body_type(front_img, height_cm)
-    bt = np.array(_BODY_TYPE_MULTIPLIERS[body_type], dtype=np.float32)
 
-    # 4) silhouette width factor (dynamic per image)
-    h, w = front_img.shape[:2]
-    gray = cv2.cvtColor(front_img, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    body_mult = np.array(
+        _BODY_TYPE_MULTIPLIERS[body_type],
+        dtype=np.float32
+    )
 
-    width_px = np.sum(mask[int(h * 0.5)] > 128)
-    width_ratio = width_px / h  # body width vs height
+    base = base * body_mult
 
-    # normalize width factor
-    width_factor = np.clip((width_ratio - 0.30) * 2.5, -0.15, 0.25)
+    # Controlled correction
+    corrections = np.clip(
+        (ratios - 0.5) * 0.35,
+        -0.12,
+        0.18
+    )
 
-    # 5) combine all
-    dynamic_scale = h_prior * bt
-
-    # apply width adjustment
-    dynamic_scale = dynamic_scale * (1.0 + width_factor)
-
-    # 6) blend with pose ratios (final correction)
-    final = dynamic_scale * (0.7 + 0.6 * ratios)
+    final = base * (1.0 + corrections)
 
     logger.info(
-        "Dynamic scale → body_type=%s width_factor=%.3f final=%s",
-        body_type, width_factor, final
+        "Dynamic scale improved body=%s final=%s",
+        body_type,
+        final
     )
 
     return final
-
 
 
 
@@ -195,23 +212,49 @@ def _build_dynamic_scale(front_img, fused_ratios, height_cm=None):
 # CSV SCALE LOADER
 # =========================
 def _load_scale_from_csv(csv_path: str) -> np.ndarray:
+
     if not os.path.exists(csv_path):
-        logger.warning("Calibration CSV not found at %s — using default SCALE.", csv_path)
+        logger.warning(
+            "Calibration CSV not found at %s — using default SCALE.",
+            csv_path
+        )
         return _DEFAULT_SCALE.copy()
+
     try:
-        df = pd.read_csv(csv_path)
+        df = pd.read_csv(
+            csv_path,
+            engine="python",
+            on_bad_lines="skip"
+        )
+
         missing = [k for k in MEASUREMENT_KEYS if k not in df.columns]
+
         if missing:
-            logger.warning("CSV missing columns: %s — using default SCALE", missing)
+            logger.warning(
+                "CSV missing columns: %s — using default SCALE",
+                missing
+            )
             return _DEFAULT_SCALE.copy()
+
         if len(df) == 0:
             logger.warning("CSV is empty — using default SCALE")
             return _DEFAULT_SCALE.copy()
+
         scale = df[MEASUREMENT_KEYS].mean().values.astype(np.float32)
-        logger.info("CSV SCALE loaded (%d rows): %s", len(df), scale)
+
+        logger.info(
+            "CSV SCALE loaded (%d rows): %s",
+            len(df),
+            scale
+        )
+
         return scale
+
     except Exception as exc:
-        logger.warning("CSV load failed: %s — using default SCALE", exc)
+        logger.warning(
+            "CSV load failed: %s — using default SCALE",
+            exc
+        )
         return _DEFAULT_SCALE.copy()
 
 
@@ -221,25 +264,42 @@ SCALE = _load_scale_from_csv(CSV_PATH)
 # =========================
 # MODEL LOAD + WARMUP
 # =========================
-def _adapt_checkpoint_shape(state_dict: dict) -> dict:
+def adapt_checkpoint_shape(state_dict: dict) -> dict:
     """
-    Adapter for checkpoint compatibility: old model had INPUT_SIZE=286 (N_GEO=10),
-    new model has INPUT_SIZE=292 (N_GEO=16). Pad input_proj weights to new size.
+    Old checkpoint:
+        [256, 286]
+
+    Current model:
+        [256, 292]
+
+    Pad missing 6 features.
     """
+
     if "input_proj.0.weight" in state_dict:
-        old_weight = state_dict["input_proj.0.weight"]  # shape: [256, 286]
+
+        old_weight = state_dict["input_proj.0.weight"]
+
+        # OLD MODEL CHECK
         if old_weight.shape[1] == 286 and old_weight.shape[0] == 256:
-            # Pad from [256, 286] to [256, 292] by repeating last 6 channels
-            new_weight = torch.nn.functional.pad(old_weight, (0, 6), mode='constant', value=0.0)
-            # Average the new columns from nearby old ones (smooth initialization)
+
+            # Create new padded tensor
+            new_weight = torch.nn.functional.pad(
+                old_weight,
+                (0, 6),
+                mode='constant',
+                value=0.0
+            )
+
+            # Initialize new columns smartly
             new_weight[:, 286:292] = old_weight[:, 280:286] * 0.5
+
             state_dict["input_proj.0.weight"] = new_weight
-            logger.info("Adapted input_proj.0.weight: [256, 286] → [256, 292]")
-    
-    if "input_proj.1.weight" in state_dict and "input_proj.1.bias" in state_dict:
-        # LayerNorm: only has weight/bias for the output dim (256), not affected
-        pass
-    
+
+            logger.info(
+                "Adapted checkpoint weight "
+                "[256,286] -> [256,292]"
+            )
+
     return state_dict
 
 
@@ -250,7 +310,7 @@ def _load_model() -> BodyTransformer:
         return m
     try:
         state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
-        state_dict = _adapt_checkpoint_shape(state_dict)
+        state_dict = adapt_checkpoint_shape(state_dict)
         m.load_state_dict(state_dict, strict=False)
         logger.info("Model loaded successfully from %s", MODEL_PATH)
     except Exception as exc:
@@ -264,7 +324,7 @@ model = _load_model()
 
 def _warmup():
     try:
-        dummy = torch.zeros(1, 1, 280, dtype=torch.float32).to(DEVICE)
+        dummy = torch.zeros(1, 1, EXPECTED_FEATURES, dtype=torch.float32).to(DEVICE)
         with torch.no_grad():
             model(dummy)
         logger.info("Model warm-up done.")
@@ -280,75 +340,79 @@ _warmup()
 # =========================
 def _detect_body_type(front_img: np.ndarray, height_cm: float = None) -> str:
     """
-    Estimate body build from front image pixel ratios.
-
-    Strategy:
-      1. Detect the person bounding box via foreground mask.
-      2. Sample pixel widths at chest level (~45% from top of bbox)
-         and hip level (~65% from top of bbox).
-      3. Compare these to height_cm to estimate proportions.
-
-    Returns: "slim" | "medium" | "heavy"
-    Fallback: "medium" if detection fails.
-
-    This is deliberately simple — it just needs to be directionally
-    correct to shift measurements by 7–12%, not be pixel-perfect.
+    Improved body type detector using edge + contour analysis
+    More stable for dark clothes and complex backgrounds.
     """
+
     try:
-        h_img, w_img = front_img.shape[:2]
+        img = front_img.copy()
+        h_img, w_img = img.shape[:2]
 
-        # Convert to grayscale and threshold to find person silhouette
-        gray = cv2.cvtColor(front_img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-        # Use Otsu threshold to separate person from background
-        _, mask = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        # Better segmentation
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
 
-        # Find contours — pick the largest (the person)
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        edges = cv2.Canny(blur, 50, 150)
+
+        kernel = np.ones((5, 5), np.uint8)
+        edges = cv2.dilate(edges, kernel, iterations=2)
+
+        contours, _ = cv2.findContours(
+            edges,
+            cv2.RETR_EXTERNAL,
+            cv2.CHAIN_APPROX_SIMPLE
+        )
+
         if not contours:
             return "medium"
 
         largest = max(contours, key=cv2.contourArea)
+
         x, y, w, h = cv2.boundingRect(largest)
 
         if h < MIN_IMG_HEIGHT or w < MIN_IMG_WIDTH:
             return "medium"
 
-        # Sample chest width at ~45% down from top of bounding box
-        chest_y = int(y + h * 0.45)
-        chest_row = mask[chest_y, x: x + w]
-        chest_px = int(np.sum(chest_row > 128))
+        # chest line
+        chest_y = int(y + h * 0.42)
 
-        # Sample hip width at ~65% down
-        hip_y = int(y + h * 0.65)
-        hip_row = mask[hip_y, x: x + w]
-        hip_px = int(np.sum(hip_row > 128))
+        # waist line
+        waist_y = int(y + h * 0.55)
 
-        # Normalize widths by height in pixels to get a proportion
+        # hip line
+        hip_y = int(y + h * 0.68)
+
+        mask = np.zeros(gray.shape, dtype=np.uint8)
+        cv2.drawContours(mask, [largest], -1, 255, -1)
+
+        chest_px = np.sum(mask[chest_y, x:x+w] > 0)
+        waist_px = np.sum(mask[waist_y, x:x+w] > 0)
+        hip_px = np.sum(mask[hip_y, x:x+w] > 0)
+
         chest_ratio = chest_px / h
-        hip_ratio   = hip_px   / h
+        waist_ratio = waist_px / h
+        hip_ratio = hip_px / h
 
         logger.info(
-            "Body type detection — chest_ratio=%.3f hip_ratio=%.3f",
-            chest_ratio, hip_ratio
+            "Improved body ratios chest=%.3f waist=%.3f hip=%.3f",
+            chest_ratio,
+            waist_ratio,
+            hip_ratio
         )
 
-        # Empirical thresholds (tuned on South Asian adult photos):
-        # slim:   chest_ratio < 0.28
-        # heavy:  chest_ratio > 0.38 or hip_ratio > 0.40
-        # medium: everything else
-        if chest_ratio < 0.28 and hip_ratio < 0.33:
-            body_type = "slim"
-        elif chest_ratio > 0.38 or hip_ratio > 0.40:
-            body_type = "heavy"
-        else:
-            body_type = "medium"
+        avg_ratio = (chest_ratio + waist_ratio + hip_ratio) / 3
 
-        logger.info("Detected body type: %s", body_type)
-        return body_type
+        if avg_ratio < 0.30:
+            return "slim"
+
+        elif avg_ratio > 0.42:
+            return "heavy"
+
+        return "medium"
 
     except Exception as exc:
-        logger.warning("Body type detection failed: %s — defaulting to medium", exc)
+        logger.warning("Improved body type detection failed: %s", exc)
         return "medium"
 
 
@@ -547,42 +611,50 @@ def _geometry_fallback(front_img, side_img, height_cm=None):
     logger.info("Body type: %s → multipliers: %s", body_type, bt_mult)
 
     if height_cm:
-        h      = height_cm
-        ratios = _get_height_ratios(h) * bt_mult   # apply body-type scaling to prior
 
-        # Blend detected ratio with body-type-adjusted anthropometric prior.
-        # For slim builds: pose detection is noisier (less body mass to detect),
-        # so we trust the prior MORE → 50/50 blend.
-        # For medium/heavy builds: pose signal is stronger → 65/35 blend.
-        blend = 0.50 if body_type == "slim" else 0.65
+     h = height_cm
 
-        def _b(r, prior_r):
-            return blend * r + (1.0 - blend) * prior_r
+    dynamic_scale = _build_dynamic_scale(
+        front_img,
+        fused[:6],
+        height_cm
+    )
 
-        chest_cm    = _b(chest_r,    ratios[0]) * h
-        waist_cm    = _b(waist_r,    ratios[1]) * h
-        hip_raw_cm  = _b(hip_r,      ratios[2]) * h
-        shoulder_cm = _b(shoulder_r, ratios[3]) * h
-        sleeve_raw  = _b(sleeve_r,   ratios[4]) * h
-        inseam_cm   = _b(inseam_r,   ratios[5]) * h
+    chest_cm = dynamic_scale[0]
+    waist_cm = dynamic_scale[1]
+    hip_cm = dynamic_scale[2]
+    shoulder_cm = dynamic_scale[3]
+    sleeve_cm = dynamic_scale[4]
+    inseam_cm = dynamic_scale[5]
 
-        # Apply sleeve correction (partial-arm fix)
-        sleeve_cm = _sleeve_correction(sleeve_raw, h)
+    # hip protection
+    hip_cm = _sanitize_hip(
+        hip_cm,
+        chest_cm,
+        height_cm=h
+    )
 
-        # Apply hip outlier guard
-        hip_cm = _sanitize_hip(hip_raw_cm, chest_cm, height_cm=h)
+    # sleeve correction
+    sleeve_cm = _sleeve_correction(
+        sleeve_cm,
+        h
+    )
 
-        result = {
-            "chest":    round(chest_cm,    1),
-            "waist":    round(waist_cm,    1),
-            "hip":      round(hip_cm,      1),
-            "shoulder": round(shoulder_cm, 1),
-            "sleeve":   round(sleeve_cm,   1),
-            "inseam":   round(inseam_cm,   1),
-        }
-        logger.info("Height+body-type measurements: %s", result)
-        return result
+    result = {
+        "chest": round(chest_cm, 1),
+        "waist": round(waist_cm, 1),
+        "hip": round(hip_cm, 1),
+        "shoulder": round(shoulder_cm, 1),
+        "sleeve": round(sleeve_cm, 1),
+        "inseam": round(inseam_cm, 1),
+    }
 
+    logger.info(
+        "Improved geometry measurements: %s",
+        result
+    )
+
+    return result
     # No height_cm — use SCALE as the base, blended with body-type multiplier
     adjusted_scale = SCALE * bt_mult
 
@@ -710,6 +782,16 @@ def detect_body(request):
 
     front_img = _decode_image(front_file)
     side_img  = _decode_image(side_file)
+
+# YOLO crop
+    front_crop = detect_person(front_img)
+    side_crop = detect_person(side_img)
+
+    if front_crop is not None:
+      front_img = front_crop
+
+    if side_crop is not None:
+       side_img = side_crop
 
     err = _validate_image(front_img, "Front") or _validate_image(side_img, "Side")
     if err:

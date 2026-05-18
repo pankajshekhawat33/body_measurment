@@ -54,6 +54,11 @@ GENDER_THRESHOLDS = {
     "male_torso_ratio":   0.260,
 }
 
+
+
+
+
+
 # ---------------------------------------------------------------------------
 # Gender correction multipliers
 # ---------------------------------------------------------------------------
@@ -137,12 +142,33 @@ def _midpoint(lm_array, a: str, b: str) -> np.ndarray:
         (lm_array[LM[a]].y + lm_array[LM[b]].y) / 2,
     ])
 
-
 def _body_height_proxy(lm_array) -> float:
-    """Nose→ankle vertical span — always a 0-1 normalized ratio."""
-    nose_y  = lm_array[LM["nose"]].y
-    ankle_y = (lm_array[LM["l_ankle"]].y + lm_array[LM["r_ankle"]].y) / 2
-    return max(abs(ankle_y - nose_y), 1e-6)
+    """
+    Better body height estimation using torso + legs.
+    More stable than nose->ankle.
+    """
+
+    shoulder_mid = _midpoint(lm_array, "l_shoulder", "r_shoulder")
+    hip_mid      = _midpoint(lm_array, "l_hip", "r_hip")
+
+    torso = np.linalg.norm(shoulder_mid - hip_mid)
+
+    l_leg = (
+        _dist(lm_array, "l_hip", "l_knee") +
+        _dist(lm_array, "l_knee", "l_ankle")
+    )
+
+    r_leg = (
+        _dist(lm_array, "r_hip", "r_knee") +
+        _dist(lm_array, "r_knee", "r_ankle")
+    )
+
+    legs = (l_leg + r_leg) / 2.0
+
+    # head approximation
+    head = torso * 0.32
+
+    return max(head + torso + legs, 1e-6)
 
 
 def _head_size_proxy(lm_array) -> float:
@@ -176,45 +202,103 @@ def _ellipse_circ(width: float, depth: float) -> float:
 # ---------------------------------------------------------------------------
 # Gender / Age classification
 # ---------------------------------------------------------------------------
+def _body_height_proxy(lm_array) -> float:
+    """
+    Better body height estimation using torso + legs.
+    More stable than nose->ankle.
+    """
+
+    shoulder_mid = _midpoint(lm_array, "l_shoulder", "r_shoulder")
+    hip_mid      = _midpoint(lm_array, "l_hip", "r_hip")
+
+    torso = np.linalg.norm(shoulder_mid - hip_mid)
+
+    l_leg = (
+        _dist(lm_array, "l_hip", "l_knee") +
+        _dist(lm_array, "l_knee", "l_ankle")
+    )
+
+    r_leg = (
+        _dist(lm_array, "r_hip", "r_knee") +
+        _dist(lm_array, "r_knee", "r_ankle")
+    )
+
+    legs = (l_leg + r_leg) / 2.0
+
+    # head approximation
+    head = torso * 0.32
+
+    return max(head + torso + legs, 1e-6)
+    
 def classify_person(lm_array) -> dict:
+
     h_proxy        = _body_height_proxy(lm_array)
     head_size      = _head_size_proxy(lm_array)
     shoulder_width = _dist(lm_array, "l_shoulder", "r_shoulder")
-    hip_width      = _dist(lm_array, "l_hip",      "r_hip")
+    hip_width      = _dist(lm_array, "l_hip", "r_hip")
 
-    head_ratio     = head_size      / h_proxy
-    shoulder_ratio = shoulder_width / h_proxy
-    hip_sh_ratio   = hip_width      / max(shoulder_width, 1e-6)
+    head_ratio      = head_size / max(h_proxy, 1e-6)
+    shoulder_ratio  = shoulder_width / max(h_proxy, 1e-6)
+    hip_sh_ratio    = hip_width / max(shoulder_width, 1e-6)
 
     ratios = {
-        "head_to_height":     round(head_ratio,     4),
+        "head_to_height":     round(head_ratio, 4),
         "shoulder_to_height": round(shoulder_ratio, 4),
-        "hip_to_shoulder":    round(hip_sh_ratio,   4),
+        "hip_to_shoulder":    round(hip_sh_ratio, 4),
     }
 
     # Kid detection
     kid_score = 0.0
-    if head_ratio     >= GENDER_THRESHOLDS["kid_head_ratio"]:     kid_score += 0.6
-    if shoulder_ratio <  GENDER_THRESHOLDS["kid_shoulder_ratio"]: kid_score += 0.4
-    if kid_score >= 0.6:
-        return {"category": "kid", "confidence": round(min(kid_score, 1.0), 3), "ratios": ratios}
 
-    # Male vs female
-    female_score = male_score = 0.0
-    if hip_sh_ratio   >= GENDER_THRESHOLDS["female_hip_ratio"]: female_score += 0.7
-    elif hip_sh_ratio >= 0.88:                                   female_score += 0.4
-    else:                                                        male_score   += 0.5
-    if shoulder_ratio >= GENDER_THRESHOLDS["male_torso_ratio"]:  male_score   += 0.5
-    elif shoulder_ratio < 0.220:                                  female_score += 0.3
+    if head_ratio >= GENDER_THRESHOLDS["kid_head_ratio"]:
+        kid_score += 0.6
+
+    if shoulder_ratio < GENDER_THRESHOLDS["kid_shoulder_ratio"]:
+        kid_score += 0.4
+
+    if kid_score >= 0.6:
+        return {
+            "category": "kid",
+            "confidence": round(min(kid_score, 1.0), 3),
+            "ratios": ratios,
+        }
+
+    # Male vs Female
+    female_score = 0.0
+    male_score   = 0.0
+
+    if hip_sh_ratio >= GENDER_THRESHOLDS["female_hip_ratio"]:
+        female_score += 0.7
+
+    elif hip_sh_ratio >= 0.88:
+        female_score += 0.4
+
+    else:
+        male_score += 0.5
+
+    if shoulder_ratio >= GENDER_THRESHOLDS["male_torso_ratio"]:
+        male_score += 0.5
+
+    elif shoulder_ratio < 0.220:
+        female_score += 0.3
 
     if female_score > male_score:
         conf = female_score / max(female_score + male_score, 1e-6)
-        return {"category": "female", "confidence": round(min(conf, 0.97), 3), "ratios": ratios}
+
+        return {
+            "category": "female",
+            "confidence": round(min(conf, 0.97), 3),
+            "ratios": ratios,
+        }
+
     else:
         conf = male_score / max(female_score + male_score, 1e-6)
-        return {"category": "male",   "confidence": round(min(conf, 0.97), 3), "ratios": ratios}
 
-
+        return {
+            "category": "male",
+            "confidence": round(min(conf, 0.97), 3),
+            "ratios": ratios,
+        }
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
@@ -238,7 +322,7 @@ def extract_pose(frame, height_cm: float = None):
     with mp_pose.Pose(
         static_image_mode=True,
         model_complexity=2,
-        enable_segmentation=False,
+        enable_segmentation=True,
         min_detection_confidence=0.6,
     ) as pose:
         rgb    = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
