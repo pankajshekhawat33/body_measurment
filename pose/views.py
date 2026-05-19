@@ -569,114 +569,120 @@ def process_images(front_img, side_img, height_cm=None):
 # GEOMETRY-ONLY FALLBACK  (v2 — body-type aware)
 # =========================
 def _geometry_fallback(front_img, side_img, height_cm=None):
-    """
-    Direct geometric estimate with three new corrections vs v1:
 
-    1. Body-type detection (slim / medium / heavy) from front silhouette
-       → scales the anthropometric prior up or down by 7–12%
-    2. Sleeve correction: pose models often return partial arm segment;
-       corrected to full shoulder→wrist length
-    3. Hip outlier guard: hip > chest × 1.18 is capped to a plausible value
-       (fixes the hip=144 bug caused by dark jeans + side-view depth spike)
-    """
     front_result = extract_pose(front_img, height_cm=height_cm)
-    side_result  = extract_pose(side_img,  height_cm=height_cm)
+    side_result = extract_pose(side_img, height_cm=height_cm)
 
     if front_result is None or front_result[0] is None:
         raise ValueError("Pose not detected in front image.")
+
     if side_result is None or side_result[0] is None:
         raise ValueError("Pose not detected in side image.")
 
     front_feat, front_class = front_result
-    side_feat, side_class   = side_result
-    fused, final_class      = fuse_features(front_feat, side_feat, front_class, side_class)
+    side_feat, side_class = side_result
 
-    # fused[0:6] = normalized ratios: chest, waist, hip, shoulder, sleeve, inseam
-    chest_r    = float(fused[0])
-    waist_r    = float(fused[1])
-    hip_r      = float(fused[2])
-    shoulder_r = float(fused[3])
-    sleeve_r   = float(fused[4])
-    inseam_r   = float(fused[5])
-
-    logger.info(
-        "Geometry fallback ratios: chest=%.4f waist=%.4f hip=%.4f "
-        "shoulder=%.4f sleeve=%.4f inseam=%.4f",
-        chest_r, waist_r, hip_r, shoulder_r, sleeve_r, inseam_r
+    fused, final_class = fuse_features(
+        front_feat,
+        side_feat,
+        front_class,
+        side_class
     )
 
-    # --- Detect body type from front image ---
     body_type = _detect_body_type(front_img, height_cm)
-    bt_mult   = np.array(_BODY_TYPE_MULTIPLIERS[body_type], dtype=np.float32)
-    logger.info("Body type: %s → multipliers: %s", body_type, bt_mult)
 
+    logger.info(f"Detected body type: {body_type}")
+
+    # =========================
+    # WITH HEIGHT
+    # =========================
     if height_cm:
 
-     h = height_cm
+        dynamic_scale = _build_dynamic_scale(
+            front_img,
+            fused[:6],
+            height_cm
+        )
 
-    dynamic_scale = _build_dynamic_scale(
-        front_img,
-        fused[:6],
-        height_cm
+        chest_cm = dynamic_scale[0]
+        waist_cm = dynamic_scale[1]
+        hip_cm = dynamic_scale[2]
+        shoulder_cm = dynamic_scale[3]
+        sleeve_cm = dynamic_scale[4]
+        inseam_cm = dynamic_scale[5]
+
+        hip_cm = _sanitize_hip(
+            hip_cm,
+            chest_cm,
+            height_cm=height_cm
+        )
+
+        sleeve_cm = _sleeve_correction(
+            sleeve_cm,
+            height_cm
+        )
+
+        result = {
+            "chest": round(float(chest_cm), 1),
+            "waist": round(float(waist_cm), 1),
+            "hip": round(float(hip_cm), 1),
+            "shoulder": round(float(shoulder_cm), 1),
+            "sleeve": round(float(sleeve_cm), 1),
+            "inseam": round(float(inseam_cm), 1),
+        }
+
+        logger.info(f"Geometry measurements with height: {result}")
+
+        return result
+
+    # =========================
+    # WITHOUT HEIGHT
+    # =========================
+
+    bt_mult = np.array(
+        _BODY_TYPE_MULTIPLIERS[body_type],
+        dtype=np.float32
     )
 
-    chest_cm = dynamic_scale[0]
-    waist_cm = dynamic_scale[1]
-    hip_cm = dynamic_scale[2]
-    shoulder_cm = dynamic_scale[3]
-    sleeve_cm = dynamic_scale[4]
-    inseam_cm = dynamic_scale[5]
-
-    # hip protection
-    hip_cm = _sanitize_hip(
-        hip_cm,
-        chest_cm,
-        height_cm=h
-    )
-
-    # sleeve correction
-    sleeve_cm = _sleeve_correction(
-        sleeve_cm,
-        h
-    )
-
-    result = {
-        "chest": round(chest_cm, 1),
-        "waist": round(waist_cm, 1),
-        "hip": round(hip_cm, 1),
-        "shoulder": round(shoulder_cm, 1),
-        "sleeve": round(sleeve_cm, 1),
-        "inseam": round(inseam_cm, 1),
-    }
-
-    logger.info(
-        "Improved geometry measurements: %s",
-        result
-    )
-
-    return result
-    # No height_cm — use SCALE as the base, blended with body-type multiplier
     adjusted_scale = SCALE * bt_mult
+
+    chest_r = float(fused[0])
+    waist_r = float(fused[1])
+    hip_r = float(fused[2])
+    shoulder_r = float(fused[3])
+    sleeve_r = float(fused[4])
+    inseam_r = float(fused[5])
 
     def _scale_blend(r, scale_val):
         deviation = np.clip(r - 0.5, -0.15, 0.15)
         return scale_val * (1.0 + deviation)
 
-    chest_cm   = _scale_blend(chest_r,    adjusted_scale[0])
-    sleeve_raw = _scale_blend(sleeve_r,   adjusted_scale[4])
-    sleeve_cm  = sleeve_raw  # no height ref available; clamp will catch extremes
-    hip_raw    = _scale_blend(hip_r,      adjusted_scale[2])
-    hip_cm     = _sanitize_hip(hip_raw, chest_cm, height_cm=None)
+    chest_cm = _scale_blend(chest_r, adjusted_scale[0])
+
+    hip_raw = _scale_blend(hip_r, adjusted_scale[2])
+
+    hip_cm = _sanitize_hip(
+        hip_raw,
+        chest_cm,
+        height_cm=None
+    )
+
+    sleeve_cm = _scale_blend(
+        sleeve_r,
+        adjusted_scale[4]
+    )
 
     result = {
-        "chest":    round(chest_cm,                                  1),
-        "waist":    round(_scale_blend(waist_r,    adjusted_scale[1]), 1),
-        "hip":      round(hip_cm,                                    1),
-        "shoulder": round(_scale_blend(shoulder_r, adjusted_scale[3]), 1),
-        "sleeve":   round(sleeve_cm,                                 1),
-        "inseam":   round(_scale_blend(inseam_r,   adjusted_scale[5]), 1),
+        "chest": round(float(chest_cm), 1),
+        "waist": round(float(_scale_blend(waist_r, adjusted_scale[1])), 1),
+        "hip": round(float(hip_cm), 1),
+        "shoulder": round(float(_scale_blend(shoulder_r, adjusted_scale[3])), 1),
+        "sleeve": round(float(sleeve_cm), 1),
+        "inseam": round(float(_scale_blend(inseam_r, adjusted_scale[5])), 1),
     }
-    logger.info("SCALE+body-type measurements (no height): %s", result)
+
+    logger.info(f"Geometry measurements without height: {result}")
+
     return result
 
 
