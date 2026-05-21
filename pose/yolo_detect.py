@@ -5,12 +5,13 @@ from ultralytics import YOLO
 model = YOLO("models/yolov8n.pt")
 
 
-def detect_person(image_path):
+def detect_person(img):
     """
     Detect person and return cropped body image
     """
 
-    img = cv2.imread(image_path)
+    if img is None:
+        return None
 
     results = model(img)
 
@@ -22,7 +23,7 @@ def detect_person(image_path):
 
         cls = int(box.cls[0])
 
-        # YOLO class 0 = person
+        # person class
         if cls == 0:
             best_box = box
             break
