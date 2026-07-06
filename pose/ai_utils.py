@@ -576,7 +576,12 @@ def fuse_features(
         final_class.get("confidence", 0.5),
     ], dtype=np.float32)
 
-    rest = np.concatenate([front_features[N_GEO:], side_features[N_GEO:]])
+    # Keep only the view-specific non-geometric payloads that the model expects:
+    # [gender(4)] + [front_vis(4) + front_raw(132)] + [side_vis(4) + side_raw(132)]
+    rest = np.concatenate([
+        front_features[N_GEO + 4:],
+        side_features[N_GEO + 4:],
+    ])
     return np.concatenate([fused_geo, gender_fused, rest]), final_class
 
 

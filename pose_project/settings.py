@@ -222,6 +222,7 @@ BODY_AI_DATASET_PATH = os.path.join(
 
 YOLO_MODEL_PATH = os.path.join(
     BASE_DIR,
+    "pose",
     "models",
     "yolov8n.pt"
 )

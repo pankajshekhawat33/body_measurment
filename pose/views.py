@@ -31,14 +31,40 @@ CSV_PATH = getattr(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "dataset.csv")
 )
 
-MEASUREMENT_KEYS = ["chest", "waist", "hip", "shoulder", "sleeve", "inseam"]
+MEASUREMENT_KEYS = [
+    "chest",
+    "waist",
+    "hip",
+    "shoulder",
+    "sleeve",
+    "inseam",
+    "torso",
+    "bicep",
+    "thigh",
+    "calf",
+    "neck",
+    "height",
+]
 
 global EXPECTED_FEATURES
-EXPECTED_FEATURES = 300 
+EXPECTED_FEATURES = 292 
 
 # Realistic mean adult measurements (cm) — used when no CSV found
 # Updated with better calibration for average adult male
-_DEFAULT_SCALE = np.array([100.0, 88.0, 102.0, 46.0, 65.0, 80.0], dtype=np.float32)
+_DEFAULT_SCALE = np.array([
+100.0,   # chest
+88.0,    # waist
+102.0,   # hip
+46.0,    # shoulder
+65.0,    # sleeve
+80.0,    # inseam
+52.0,    # torso
+34.0,    # bicep
+58.0,    # thigh
+38.0,    # calf
+39.0,    # neck
+170.0    # height
+],dtype=np.float32)
 
 # -----------------------------------------------------------------------
 # ANTHROPOMETRIC RATIO TABLE
@@ -79,11 +105,56 @@ def _get_height_ratios(height_cm: float) -> np.ndarray:
 # Multipliers are applied to the height-ratio-based prior.
 # -----------------------------------------------------------------------
 _BODY_TYPE_MULTIPLIERS = {
-    # build: [chest, waist, hip, shoulder, sleeve, inseam]
-    "slim":   [0.90, 0.85, 0.88, 0.95, 0.98, 1.00],
-    "medium": [1.00, 1.00, 1.00, 1.00, 1.00, 1.00],
-    "heavy":  [1.12, 1.18, 1.12, 1.04, 1.00, 1.00],
+    # build:
+    # [chest, waist, hip, shoulder, sleeve, inseam,
+    #  torso, bicep, thigh, calf, neck, height]
+
+    "slim": [
+        0.90,   # chest
+        0.85,   # waist
+        0.88,   # hip
+        0.95,   # shoulder
+        0.98,   # sleeve
+        1.00,   # inseam
+        0.95,   # torso
+        0.92,   # bicep
+        0.94,   # thigh
+        0.95,   # calf
+        0.95,   # neck
+        1.00    # height
+    ],
+
+    "medium": [
+        1.00,   # chest
+        1.00,   # waist
+        1.00,   # hip
+        1.00,   # shoulder
+        1.00,   # sleeve
+        1.00,   # inseam
+        1.00,   # torso
+        1.00,   # bicep
+        1.00,   # thigh
+        1.00,   # calf
+        1.00,   # neck
+        1.00    # height
+    ],
+
+    "heavy": [
+        1.12,   # chest
+        1.18,   # waist
+        1.12,   # hip
+        1.04,   # shoulder
+        1.00,   # sleeve
+        1.00,   # inseam
+        1.08,   # torso
+        1.12,   # bicep
+        1.10,   # thigh
+        1.08,   # calf
+        1.08,   # neck
+        1.00    # height
+    ],
 }
+
 
 # Clamp ranges (cm) — anatomically validated
 # Updated to avoid false minimum clamping for realistic adults
@@ -94,6 +165,12 @@ MEASUREMENT_CLAMP = {
     "shoulder": (40.0,   75.0),    # increased from 36
     "sleeve":   (55.0,  105.0),    # increased from 52
     "inseam":   (65.0,  105.0),    # increased from 55
+    "torso":    (40.0,   80.0),
+    "bicep":    (25.0,   50.0), 
+    "thigh":    (40.0,   70.0),
+    "calf":     (30.0,   50.0),
+    "neck":     (30.0,   50.0),
+    "height":   (100.0, 250.0),
 }
 
 # Hip sanity guard: hip cannot exceed chest by more than this factor
@@ -124,27 +201,23 @@ def _save_to_dataset_csv(features_array: np.ndarray, measurements: dict, dataset
             )
             return False
 
-        feature_cols = [f"f{i}" for i in range(EXPECTED_FEATURES)]
+        feature_cols = [
+         f"f{i}"
+         for i in range(len(features_flat))
+]
 
-        measurement_cols = [
-            "chest",
-            "waist",
-            "hip",
-            "shoulder",
-            "sleeve",
-            "inseam",
-        ]
+        measurement_cols = MEASUREMENT_KEYS
+        row_data = list(features_flat)
+  
+        for key in MEASUREMENT_KEYS:
+          row_data.append(float(measurements.get(key,0)))
 
         all_cols = feature_cols + measurement_cols
 
-        row_data = list(features_flat) + [
-            float(measurements["chest"]),
-            float(measurements["waist"]),
-            float(measurements["hip"]),
-            float(measurements["shoulder"]),
-            float(measurements["sleeve"]),
-            float(measurements["inseam"]),
-        ]
+     
+
+        
+
 
         file_exists = os.path.exists(dataset_path)
 
@@ -154,7 +227,7 @@ def _save_to_dataset_csv(features_array: np.ndarray, measurements: dict, dataset
 
         writer.to_csv(
             dataset_path,
-            mode="a",
+            mode="a",  
             index=False,
             header=not file_exists,
         )
@@ -165,17 +238,46 @@ def _save_to_dataset_csv(features_array: np.ndarray, measurements: dict, dataset
 
     except Exception as exc:
         logger.exception(f"Failed to save to dataset.csv: {exc}")
-        EXPECTED_FEATURES = 300
+        
         return False
 
 
 
 def _build_dynamic_scale(front_img, fused_ratios, height_cm=None):
+    """
+    Build dynamic measurement scale based on
+    body type + pose ratios.
 
+    Returns 12 measurement scales:
+    chest, waist, hip, shoulder,
+    sleeve, inseam,
+    torso, bicep, thigh,
+    calf, neck, height
+    """
+
+    # Only first 6 pose ratios exist
     ratios = np.array(fused_ratios[:6], dtype=np.float32)
 
+    # Base measurements
     if height_cm:
-        base = _get_height_ratios(height_cm) * height_cm
+        height_ratios = _get_height_ratios(height_cm)
+
+        base = np.array([
+            height_ratios[0] * height_cm,   # chest
+            height_ratios[1] * height_cm,   # waist
+            height_ratios[2] * height_cm,   # hip
+            height_ratios[3] * height_cm,   # shoulder
+            height_ratios[4] * height_cm,   # sleeve
+            height_ratios[5] * height_cm,   # inseam
+
+            height_cm * 0.30,               # torso
+            height_cm * 0.19,               # bicep
+            height_cm * 0.34,               # thigh
+            height_cm * 0.22,               # calf
+            height_cm * 0.23,               # neck
+            height_cm                       # height
+        ], dtype=np.float32)
+
     else:
         base = SCALE.copy()
 
@@ -186,25 +288,27 @@ def _build_dynamic_scale(front_img, fused_ratios, height_cm=None):
         dtype=np.float32
     )
 
-    base = base * body_mult
+    # Apply body-type scaling
+    base *= body_mult
 
-    # Controlled correction
+    # Pose correction only for first six measurements
     corrections = np.clip(
         (ratios - 0.5) * 0.35,
         -0.12,
         0.18
     )
 
-    final = base * (1.0 + corrections)
+    final = base.copy()
+
+    final[:6] *= (1.0 + corrections)
 
     logger.info(
-        "Dynamic scale improved body=%s final=%s",
+        "Dynamic scale body=%s final=%s",
         body_type,
         final
     )
 
     return final
-
 
 
 
@@ -622,18 +726,27 @@ def _geometry_fallback(front_img, side_img, height_cm=None):
             height_cm
         )
 
-        result = {
-            "chest": round(float(chest_cm), 1),
-            "waist": round(float(waist_cm), 1),
-            "hip": round(float(hip_cm), 1),
-            "shoulder": round(float(shoulder_cm), 1),
-            "sleeve": round(float(sleeve_cm), 1),
-            "inseam": round(float(inseam_cm), 1),
-        }
+    result = {
+    "height": round(float(height_cm), 1),
 
-        logger.info(f"Geometry measurements with height: {result}")
+    "chest": round(float(chest_cm), 1),
+    "bust": round(float(chest_cm), 1),          # Female support
 
-        return result
+    "waist": round(float(waist_cm), 1),
+    "hip": round(float(hip_cm), 1),
+    "shoulder": round(float(shoulder_cm), 1),
+    "sleeve": round(float(sleeve_cm), 1),
+
+    "length": round(float(height_cm * 0.42), 1),   # Shirt/Kurti length (estimated)
+    "inseam": round(float(inseam_cm), 1),
+
+    "torso": round(float(height_cm * 0.30), 1),
+    "neck": round(float(chest_cm * 0.38), 1),
+    "bicep": round(float(chest_cm * 0.32), 1),
+    "thigh": round(float(hip_cm * 0.62), 1),
+    "calf": round(float(hip_cm * 0.38), 1),
+    
+}
 
     # =========================
     # WITHOUT HEIGHT
@@ -690,63 +803,41 @@ def _geometry_fallback(front_img, side_img, height_cm=None):
 # POST-PROCESS SANITY CHECK
 # =========================
 def _sanity_check(m: dict, height_cm: float = None) -> dict:
-    """
-    Final cross-measurement consistency checks.
 
-    Rules (anatomical):
-      1. hip cannot exceed chest × 1.18        → already handled by _sanitize_hip,
-                                                  but catch transformer path too
-      2. waist must be < chest                  → waist > chest = impossible
-      3. shoulder must be < chest / 1.8         → shoulder > 28cm × 2 is suspicious
-      4. sleeve must be >= shoulder × 1.5       → if sleeve < shoulder, it's forearm only
-      5. inseam must be > sleeve                → for most people, legs longer than arms
-    """
-    chest    = m["chest"]
-    waist    = m["waist"]
-    hip      = m["hip"]
-    shoulder = m["shoulder"]
-    sleeve   = m["sleeve"]
-    inseam   = m["inseam"]
+    # copy all measurements
+    result = dict(m)
 
-    # Rule 1: hip cap
+    chest = float(result.get("chest", 0))
+    waist = float(result.get("waist", 0))
+    hip = float(result.get("hip", 0))
+    shoulder = float(result.get("shoulder", 0))
+    sleeve = float(result.get("sleeve", 0))
+    inseam = float(result.get("inseam", 0))
+
     hip = _sanitize_hip(hip, chest, height_cm)
 
-    # Rule 2: waist < chest
     if waist >= chest:
-        logger.warning("Sanity: waist(%.1f) >= chest(%.1f) — correcting", waist, chest)
         waist = chest * 0.88
 
-    # Rule 3: shoulder plausibility
     max_shoulder = chest / 1.8
+
     if shoulder > max_shoulder:
-        logger.warning("Sanity: shoulder(%.1f) > max(%.1f) — correcting", shoulder, max_shoulder)
         shoulder = max_shoulder
 
-    # Rule 4: sleeve >= shoulder × 1.5 (otherwise it's elbow only)
     if sleeve < shoulder * 1.5:
-        logger.warning(
-            "Sanity: sleeve(%.1f) looks like partial arm (shoulder=%.1f) — correcting",
-            sleeve, shoulder
-        )
-        sleeve = _sleeve_correction(sleeve, height_cm) if height_cm else shoulder * 1.7
+        if height_cm:
+            sleeve = _sleeve_correction(sleeve, height_cm)
+        else:
+            sleeve = shoulder * 1.7
 
-    # Rule 5: inseam > sleeve (for most adult builds)
-    # Don't auto-correct this — just log it as a warning
-    if inseam < sleeve:
-        logger.warning(
-            "Sanity: inseam(%.1f) < sleeve(%.1f) — unusual, check pose detection",
-            inseam, sleeve
-        )
+    result["chest"] = round(chest,1)
+    result["waist"] = round(waist,1)
+    result["hip"] = round(hip,1)
+    result["shoulder"] = round(shoulder,1)
+    result["sleeve"] = round(sleeve,1)
+    result["inseam"] = round(inseam,1)
 
-    return {
-        "chest":    round(chest,    1),
-        "waist":    round(waist,    1),
-        "hip":      round(hip,      1),
-        "shoulder": round(shoulder, 1),
-        "sleeve":   round(sleeve,   1),
-        "inseam":   round(inseam,   1),
-    }
-
+    return result
 
 # =========================
 # API
@@ -826,7 +917,17 @@ def detect_body(request):
             method = "Geometry only (train BodyTransformer for 90%+ accuracy)"
 
     except ValueError as exc:
-        return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+       import traceback
+       traceback.print_exc()
+
+       print("VALUE ERROR =", str(exc))
+
+       return Response(
+        {
+            "error": str(exc)
+        },
+        status=400,
+    )
     except Exception:
         logger.exception("Inference error.")
         return Response(
@@ -837,6 +938,21 @@ def detect_body(request):
     # Clamp first, then cross-measurement sanity check
     measurements = _clamp_measurements(measurements)
     measurements = _sanity_check(measurements, height_cm=height_cm)
+
+
+
+
+    defaults = {
+        "torso": 0.0,
+        "bicep": 0.0,
+        "thigh": 0.0,
+        "calf": 0.0,
+        "neck": 0.0,
+        "height": float(height_cm) if height_cm else 0.0,
+    }
+
+    for key, value in defaults.items():
+        measurements.setdefault(key, value)
 
     # Save to dataset.csv: extract fresh features and append
     try:

@@ -24,7 +24,7 @@ import torch.nn.functional as F
 
 # Derived from ai_utils.py: N_GEO=16, gender=4, vis=4, lm=132, ×2 views
 INPUT_SIZE  = 292   # FIX: was 286 (N_GEO=10), now 292 (N_GEO=16)
-OUTPUT_SIZE = 6
+OUTPUT_SIZE = 12
 D_MODEL     = 256
 
 
@@ -121,8 +121,22 @@ class MeasurementLoss(nn.Module):
         super().__init__()
         # [chest, waist, hip, shoulder, sleeve, inseam]
         self.weights = torch.tensor(
-            [1.5, 1.5, 1.2, 1.0, 1.0, 1.0], dtype=torch.float32
-        )
+    [
+        1.5,  # chest
+        1.5,  # waist
+        1.2,  # hip
+        1.0,  # shoulder
+        1.0,  # sleeve
+        1.0,  # inseam
+        1.0,  # torso
+        1.0,  # bicep
+        1.0,  # thigh
+        1.0,  # calf
+        1.0,  # neck
+        1.0   # height
+    ],
+    dtype=torch.float32
+)
 
     def forward(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
         w = self.weights.to(pred.device)

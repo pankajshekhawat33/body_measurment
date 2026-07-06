@@ -1,14 +1,15 @@
+import os
 import cv2
 from ultralytics import YOLO
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "models", "yolov8n.pt")
+
 # Load YOLO model
-model = YOLO("models/yolov8n.pt")
+model = YOLO(MODEL_PATH)
 
 
 def detect_person(img):
-    """
-    Detect person and return cropped body image
-    """
 
     if img is None:
         return None
